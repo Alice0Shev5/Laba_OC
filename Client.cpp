@@ -1,137 +1,117 @@
-﻿#include <windows.h>
-#include <iostream>
+﻿#include <iostream>
 #include <string>
-#define BUFSIZE 512
+
+#include <winsock2.h>
+
+#pragma comment(lib, "ws2_32.lib")
+#pragma warning(disable: 4996)
+
 using namespace std;
 
-void print_time() {
-    SYSTEMTIME lt;
-    GetLocalTime(&lt);
-    printf("%02d:%02d:%02d.%03d\t", lt.wHour, lt.wMinute, lt.wSecond, lt.wMilliseconds);
+const string SERVER_IP = "127.0.0.1";
+const int PORT = 12345;
+const int BUFFER_SIZE = 1024;
+
+HANDLE hConsole;
+HANDLE exitEvent;
+int textColor = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
+
+
+DWORD WINAPI ReceiveThread(LPVOID lpParam) {
+    SOCKET sock = *(SOCKET*)lpParam;
+    char buffer[BUFFER_SIZE];
+    int bytesReceived;
+
+    while (true) {
+        if (WaitForSingleObject(exitEvent, 0) == WAIT_OBJECT_0) {
+            break;
+        }
+
+        bytesReceived = recv(sock, buffer, BUFFER_SIZE, 0);
+        if (bytesReceived <= 0) {
+            cout << "Соединение с сервером потеряно." << endl;
+            SetEvent(exitEvent);
+            break;
+        }
+
+        string message(buffer, bytesReceived);
+
+        if (message.find("COLOR:") == 0) {
+            textColor = stoi(message.substr(6));
+            SetConsoleTextAttribute(hConsole, textColor);
+        }
+        else {
+            SetConsoleTextAttribute(hConsole, textColor);
+            cout << message;
+            SetConsoleTextAttribute(hConsole, FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
+        }
+    }
+    return 0;
 }
 
-int main(int argc, char* argv[])
-{
+
+int main() {
     Sleep(2000);
-    // Парсинг аргументов командной строки
-    if (argc < 2) {
-        print_time();
-        cout << "[ERROR] Lifetime parameter not specified\n";
-        return -1;
+    setlocale(LC_ALL, "RU");
+    hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    SetConsoleTextAttribute(hConsole, FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
+    exitEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        cerr << "Ошибка инициализации Winsock" << endl;
+        return 1;
     }
 
-    int lifetime = 0;
-    try {
-        lifetime = stoi(argv[1]);
-    }
-    catch (...) {
-        print_time();
-        cout << "[ERROR] Invalid lifetime parameter\n";
-        return -1;
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET) {
+        cerr << "Ошибка создания сокета" << endl;
+        WSACleanup();
+        return 1;
     }
 
-    print_time();
-    cout << "[CLIENT] Started with lifetime: " << (lifetime == 0 ? "infinite" : to_string(lifetime) + " seconds") << '\n';
+    sockaddr_in serverAddr;
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = inet_addr(SERVER_IP.c_str());
+    serverAddr.sin_port = htons(PORT);
 
-    HANDLE hPipe;
-    DWORD cbIO;
-    const int CONFIRMATION = 1; // Код подтверждения для сервера
+    if (connect(sock, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
+        cerr << "Ошибка подключения к серверу" << endl;
+        closesocket(sock);
+        WSACleanup();
+        return 1;
+    }
 
-    // Подключение к серверу
+    cout << "Подключено к серверу. Введите ваше имя: ";
+    string name;
+    getline(cin, name);
+    send(sock, name.c_str(), name.size() + 1, 0);
+
+    HANDLE receiveThread = CreateThread(NULL, 0, ReceiveThread, &sock, 0, NULL);
+
+    cout << "Теперь вы можете отправлять сообщения. Введите 'exit' для выхода." << endl;
+
     while (true) {
-        hPipe = CreateFile(
-            L"\\\\.\\pipe\\mynamedpipe",
-            GENERIC_READ | GENERIC_WRITE,
-            0,
-            NULL,
-            OPEN_EXISTING,
-            0,
-            NULL);
+        string message;
+        getline(cin, message);
 
-        if (hPipe != INVALID_HANDLE_VALUE)
+        if (message == "exit") {
+            SetEvent(exitEvent);
             break;
-
-        DWORD dwError = GetLastError();
-        if (dwError != ERROR_PIPE_BUSY) {
-            print_time();
-            cout << "[ERROR] Could not open pipe. GLE=" << dwError << '\n';
-            return -1;
         }
 
-        if (!WaitNamedPipe(L"\\\\.\\pipe\\mynamedpipe", 20000)) {
-            print_time();
-            cout << "[ERROR] Could not open pipe: 20 second wait timed out.\n";
-            return -1;
+        if (send(sock, message.c_str(), message.size() + 1, 0) == SOCKET_ERROR) {
+            cerr << "Ошибка отправки сообщения" << endl;
+            SetEvent(exitEvent);
+            break;
         }
     }
 
-    // Установка режима чтения для канала
-    DWORD dwMode = PIPE_READMODE_MESSAGE;
-    if (!SetNamedPipeHandleState(hPipe, &dwMode, NULL, NULL)) {
-        print_time();
-        cout << "[ERROR] SetNamedPipeHandleState failed. GLE=" << GetLastError() << '\n';
-        CloseHandle(hPipe);
-        return -1;
-    }
+    WaitForSingleObject(receiveThread, INFINITE);
+    CloseHandle(receiveThread);
 
-    // Отправка подтверждения серверу
-    if (!WriteFile(hPipe, &CONFIRMATION, sizeof(CONFIRMATION), &cbIO, NULL)) {
-        print_time();
-        cout << "[ERROR] WriteFile to pipe failed. GLE=" << GetLastError() << '\n';
-        CloseHandle(hPipe);
-        return -1;
-    }
-
-    
-    print_time();
-    cout << "[CLIENT] Confirmation sent to server\n";
-
-    // Основная работа клиента
-    if (lifetime == 0) {
-        // Бесконечный режим работы
-        print_time();
-        cout << "[CLIENT] Running in infinite mode\n";
-        while (true) {
-            // Полезная работа клиента
-            Sleep(1000);
-
-            // Проверка соединения с сервером
-            if (!WriteFile(hPipe, &CONFIRMATION, sizeof(CONFIRMATION), &cbIO, NULL)) {
-                print_time();
-                    cout << "[ERROR] Connection with server lost\n";
-                    break;
-            }
-        }
-    }
-    else {
-        // Режим с ограниченным временем жизни
-        print_time();
-            cout << "[CLIENT] Running for " << lifetime << " seconds\n";
-
-            DWORD startTime = GetTickCount();
-        while ((GetTickCount() - startTime) < (DWORD)(lifetime * 1000)) {
-            // Полезная работа клиента
-            Sleep(1000);
-
-            // Периодическая проверка соединения
-            if (!WriteFile(hPipe, &CONFIRMATION, sizeof(CONFIRMATION), &cbIO, NULL)) {
-                print_time();
-                cout << "[ERROR] Connection with server lost\n";
-                break;
-            }
-
-            // Вывод оставшегося времени каждые 5 секунд
-            if (((GetTickCount() - startTime) / 1000) % 5 == 0) {
-                print_time();
-                cout << "[CLIENT] Time remaining: "
-                    << (lifetime - (GetTickCount() - startTime) / 1000)
-                    << " seconds\n";
-            }
-        }
-    }
-
-    print_time();
-    cout << "[CLIENT] Work completed. Exiting...\n";
-    CloseHandle(hPipe);
+    closesocket(sock);
+    CloseHandle(exitEvent);
+    WSACleanup();
     return 0;
 }
